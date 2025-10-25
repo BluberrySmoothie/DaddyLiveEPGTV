@@ -1,22 +1,21 @@
 """
 whatson.py
 
-Generates a scrolling schedule video from the DaddyLiveStream JSON schedule.
+Generates a scrolling schedule video from the DaddyLiveHD HTML schedule.
 Refreshes every hour on the hour.
 
 Usage:
     py whatson.py
 
 Dependencies (install with):
-    py -m pip install requests python-dateutil pytz moviepy imageio-ffmpeg pillow
+    py -m pip install requests python-dateutil pytz moviepy imageio-ffmpeg pillow beautifulsoup4
 
 Important:
 - Place an optional background audio file named "background.mp3" next to this script if you want music.
 - Output is written to ./output/schedule.mp4 (6 minutes total - 3 loops of 2 minutes each)
 
 Behavior summary:
-- Fetches JSON from https://daddylivestream.com/schedule/schedule-generated.php
-  with header Referer: https://daddylivestream.com/
+- Fetches HTML from https://dlhd.dad/
 - Skips categories containing 'TV Show' or 'TV Shows' (case-insensitive).
 - Keeps any event where (event_start + 3 hours) >= now (UK local time).
 - Sorts events within each category by time (UK).
@@ -33,6 +32,7 @@ import subprocess
 from datetime import datetime, timedelta
 
 import requests
+from bs4 import BeautifulSoup  # <-- ADDED
 from dateutil import parser as dparser
 from dateutil import tz
 import pytz
@@ -43,8 +43,8 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
 # Config
-SCHEDULE_URL = "https://daddylivestream.com/schedule/schedule-generated.php"
-REFERER = "https://daddylivestream.com/"
+SCHEDULE_URL = "https://dlhd.dad/"  # <-- UPDATED
+REFERER = "https://dlhd.dad/"      # <-- UPDATED
 OUTPUT_DIR = "output"
 VIDEO_FILENAME = os.path.join(OUTPUT_DIR, "schedule.mp4")
 TEMP_VIDEO_FILENAME = os.path.join(OUTPUT_DIR, "schedule_temp.mp4")
@@ -76,75 +76,116 @@ KEEP_AFTER_HOURS = 3
 # ensure output dir exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def fetch_schedule_json(url=SCHEDULE_URL):
-    headers = {"Referer": REFERER, "User-Agent": "schedule-generator/1.0"}
-    r = requests.get(url, headers=headers, timeout=20)
-    r.raise_for_status()
-    return r.json()
+# --- OLD FUNCTIONS REMOVED ---
+# def fetch_schedule_json(url=SCHEDULE_URL):
+# def choose_date_from_top_key(json_obj):
 
-def choose_date_from_top_key(json_obj):
-    # The JSON uses a top-level key like "Friday 10th Oct 2025 - Schedule Time UK GMT"
-    # We'll try to parse the first top-level key to get the date.
-    top_keys = list(json_obj.keys())
-    if not top_keys:
-        raise ValueError("Empty JSON (no top-level keys).")
-    first = top_keys[0]
-    # pick up something like "Friday 10th Oct 2025"
-    # take substring before '-' if present
-    date_part = first.split(" - ")[0].strip()
-    # Remove any weekday prefix like "Friday "
+# --- NEW FUNCTIONS ADDED/MODIFIED ---
+
+def get_schedule_date(soup):
+    """
+    Parses the date from the <div class="schedule__dayTitle"> element.
+    e.g., "Saturday 25th Oct 2025 - Schedule Time UK GMT"
+    """
     try:
-        parsed = dparser.parse(date_part, dayfirst=True, fuzzy=True)
-        return parsed.date()
+        title_element = soup.find('div', class_='schedule__dayTitle')
+        if not title_element:
+            raise ValueError("Could not find 'schedule__dayTitle' element")
+        
+        date_part = title_element.get_text(strip=True).split(" - ")[0].strip()
+        parsed_date = dparser.parse(date_part, fuzzy=True).date()
+        return parsed_date
     except Exception as e:
-        # fallback to today's date in UK
-        print("Warning: couldn't parse date from top key; falling back to today's UK date:", e)
+        print(f"Warning: couldn't parse date from HTML title. Falling back to today's UK date. Error: {e}")
         return datetime.now(tz=tz.gettz("Europe/London")).date()
 
-def build_event_list(json_obj):
-    # find the date
-    schedule_date = choose_date_from_top_key(json_obj)
+def fetch_and_build_event_list():
+    """
+    Fetches the HTML from SCHEDULE_URL, parses it with BeautifulSoup,
+    and builds the event list in the format expected by the rest of the script.
+    """
+    headers = {"Referer": REFERER, "User-Agent": "schedule-generator/1.0"}
+    try:
+        print("Fetching HTML schedule from:", SCHEDULE_URL)
+        r = requests.get(SCHEDULE_URL, headers=headers, timeout=20)
+        r.raise_for_status()
+        print("Successfully fetched HTML.")
+    except requests.RequestException as e:
+        print(f"Error fetching HTML: {e}")
+        return []
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+    
+    # Get the base date for the schedule
+    schedule_date = get_schedule_date(soup)
     tz_london = pytz.timezone("Europe/London")
     events = []  # dicts with keys: category, dt (aware), event, channels (list)
-    for top_key, value in json_obj.items():
-        # value is a dict of categories
-        if not isinstance(value, dict):
-            # in your sample top-level key *is* the date and value contains categories
-            # if the JSON already is categories (no top level date), handle that too
+
+    # Find all category blocks
+    category_blocks = soup.find_all('div', class_='schedule__category')
+    
+    for category_block in category_blocks:
+        # Get category name
+        category_header = category_block.find('div', class_='schedule__catHeader')
+        if not category_header:
             continue
-        for category, evlist in value.items():
-            # skip TV Show categories (case-insensitive substring)
-            if "tv show" in category.lower() or "tv shows" in category.lower():
+            
+        category_meta = category_header.find('div', class_='card__meta')
+        if not category_meta:
+            continue
+            
+        category_name = category_meta.get_text(strip=True)
+
+        # skip TV Show categories (case-insensitive substring)
+        if "tv show" in category_name.lower() or "tv shows" in category_name.lower():
+            continue
+
+        # Find all events in this category
+        event_blocks = category_block.find_all('div', class_='schedule__event')
+        
+        for event_block in event_blocks:
+            time_str_elem = event_block.find('span', class_='schedule__time')
+            event_title_elem = event_block.find('span', class_='schedule__eventTitle')
+            
+            if not time_str_elem or not event_title_elem:
                 continue
-            # each evlist is a list of events
-            if not isinstance(evlist, list):
+
+            time_str = time_str_elem.get_text(strip=True)
+            event_title = event_title_elem.get_text(strip=True)
+            
+            # Get channels
+            channels = []
+            channels_container = event_block.find('div', class_='schedule__channels')
+            if channels_container:
+                channel_links = channels_container.find_all('a')
+                for link in channel_links:
+                    channels.append(link.get_text(strip=True))
+            
+            if not time_str:
                 continue
-            for ev in evlist:
-                time_str = ev.get("time", "").strip()
-                event_title = ev.get("event", "").strip()
-                channels = ev.get("channels", []) or []
+
+            try:
                 # parse time like '15:57' and combine with schedule_date
-                if not time_str:
-                    continue
-                try:
-                    # some times like '00:00' may imply next day if schedule is late-night;
-                    # we'll parse naive time and then attach the schedule_date.
-                    t = dparser.parse(time_str).time()
-                    naive_dt = datetime.combine(schedule_date, t)
-                    aware_dt = tz_london.localize(naive_dt)
-                    # Heuristic: if event time is before 06:00 and schedule_date is today,
-                    # it's possible it's actually after midnight (still same date in file).
-                    # We'll leave as-is; user can tell me if adjustments needed.
-                except Exception:
-                    # if parsing fails, skip
-                    continue
-                events.append({
-                    "category": category,
-                    "dt": aware_dt,
-                    "event": event_title,
-                    "channels": channels
-                })
+                t = dparser.parse(time_str).time()
+                naive_dt = datetime.combine(schedule_date, t)
+                aware_dt = tz_london.localize(naive_dt)
+            except Exception as e:
+                print(f"Warning: Could not parse time '{time_str}' for event '{event_title}'. Skipping. Error: {e}")
+                continue
+
+            events.append({
+                "category": category_name,
+                "dt": aware_dt,
+                "event": event_title,
+                "channels": channels
+            })
+
+    print(f"Parsed {len(events)} events from HTML.")
     return events
+
+
+# --- SCRIPT REMAINS UNCHANGED FROM THIS POINT DOWN ---
+# (Except for the main block at the very end)
 
 def filter_and_sort_events(events):
     tz_london = pytz.timezone("Europe/London")
@@ -155,421 +196,368 @@ def filter_and_sort_events(events):
         # If event start + KEEP_AFTER_HOURS >= now, keep (i.e. not older than 3 hours after start)
         if start + timedelta(hours=KEEP_AFTER_HOURS) >= now:
             keep.append(e)
+
     # sort by category then time
     keep_sorted = sorted(keep, key=lambda x: (x["category"].lower(), x["dt"]))
+    
     # group ordering by category preserve order
     grouped = {}
     for e in keep_sorted:
         grouped.setdefault(e["category"], []).append(e)
     return grouped
 
+
 def build_text_lines(grouped):
     """
-    Returns a list of text lines (strings) that will be rendered and scrolled.
-    Format:
-    [Category]
-    HH:MM - Event
-    Channel1 / Channel2
-    (blank line)
+    Returns a list of text lines (strings) that will be
+    drawn onto the image, based on the sorted/grouped events.
     """
-    tz_london = pytz.timezone("Europe/London")
     lines = []
-    now = datetime.now(tz=tz_london)
-    for cat, evs in grouped.items():
-        lines.append(f"[{cat}]")
-        for e in evs:
-            start = e["dt"]
-            time_label = start.strftime("%H:%M")
-            
-            # FIX: Handle channels safely - they can be dicts, strings, or other types
-            channels_list = e.get("channels", []) or []
-            channel_names = []
-            
-            if isinstance(channels_list, list):
-                for c in channels_list:
-                    if isinstance(c, dict):
-                        # It's a dictionary with channel_name
-                        channel_names.append(c.get("channel_name", ""))
-                    elif isinstance(c, str):
-                        # It's already a string
-                        channel_names.append(c)
-            elif isinstance(channels_list, dict):
-                # Sometimes channels might be a dict instead of a list
-                # Try to extract channel_name if it exists
-                if "channel_name" in channels_list:
-                    channel_names.append(channels_list["channel_name"])
-            
-            channels = " / ".join([name for name in channel_names if name]) or ""
-            
-            # Event line
-            line = f"{time_label} - {e['event']}"
-            lines.append(line)
-            # Channel line (separate)
-            if channels:
-                lines.append(f"  {channels}")  # Indented with channels marker
-            else:
-                lines.append("  ")  # Empty placeholder
-            # Gap before next event
-            lines.append("")
-        # spacing between categories
-        lines.append("")
+    for category, events in grouped.items():
+        lines.append(f"TITLE:{category}")
+        for e in events:
+            time_str = e["dt"].strftime("%H:%M")
+            lines.append(f"LINE:{time_str} {e['event']}")
+            if e["channels"]:
+                # add channel line, indented
+                lines.append(f"CHANNEL:    ({', '.join(e['channels'])})")
+            lines.append(f"SPACER:{EVENT_SPACING}") # small gap
+        lines.append(f"SPACER:{CATEGORY_SPACING}") # big gap
     return lines
 
-def render_text_image(lines, width, padding=40):
-    """
-    Render a long vertical image containing the lines of text.
-    Return PIL.Image object.
-    """
-    # Auto-detect font if not specified
-    font_path_to_use = FONT_PATH
-    if not font_path_to_use:
-        print("Searching for system fonts...")
-        for path in FONT_PATHS_TO_TRY:
-            print(f"  Checking: {path} ... ", end="")
-            if os.path.isfile(path):
-                font_path_to_use = path
-                print("FOUND!")
-                break
-            else:
-                print("not found")
-        
-        if not font_path_to_use:
-            # Try to list what fonts ARE available
-            print("\nNo fonts found in standard locations. Checking Windows Fonts folder...")
-            fonts_dir = r"C:\Windows\Fonts"
-            if os.path.isdir(fonts_dir):
-                ttf_fonts = [f for f in os.listdir(fonts_dir) if f.lower().endswith('.ttf')]
-                if ttf_fonts:
-                    print(f"Found {len(ttf_fonts)} TTF fonts. Using first one: {ttf_fonts[0]}")
-                    font_path_to_use = os.path.join(fonts_dir, ttf_fonts[0])
-                else:
-                    print("No TTF fonts found!")
+def find_font():
+    """Find a usable font from the preferred list."""
+    global FONT_PATH
+    if FONT_PATH and os.path.isfile(FONT_PATH):
+        return FONT_PATH
+
+    for font_path in FONT_PATHS_TO_TRY:
+        if os.path.isfile(font_path):
+            FONT_PATH = font_path
+            print(f"Using font: {FONT_PATH}")
+            return FONT_PATH
     
-    # choose fonts
-    if font_path_to_use and os.path.isfile(font_path_to_use):
+    print("Warning: No preferred fonts found. Relying on PIL default font.")
+    FONT_PATH = "default"
+    return None
+
+def load_font(size):
+    """Loads a font at a specific size, falling back to default if needed."""
+    font_path = find_font()
+    if font_path == "default":
         try:
-            font_title = ImageFont.truetype(font_path_to_use, FONT_SIZE_TITLE)
-            font_line = ImageFont.truetype(font_path_to_use, FONT_SIZE_LINE)
-            font_channel = ImageFont.truetype(font_path_to_use, FONT_SIZE_CHANNEL)
-            print(f"✓ Loaded TrueType fonts: Title={FONT_SIZE_TITLE}px, Line={FONT_SIZE_LINE}px, Channel={FONT_SIZE_CHANNEL}px")
-            print(f"  Using font file: {font_path_to_use}")
-        except Exception as e:
-            print(f"ERROR: Could not load TrueType font: {e}")
-            print("Falling back to default font (will be very small)")
-            font_title = ImageFont.load_default()
-            font_line = ImageFont.load_default()
-            font_channel = ImageFont.load_default()
-    else:
-        print("WARNING: No TrueType font found! Text will be very small.")
-        print("Please set FONT_PATH in the script to a valid .ttf file path")
-        font_title = ImageFont.load_default()
-        font_line = ImageFont.load_default()
-        font_channel = ImageFont.load_default()
+            # Try to get a default font, size might not be respected
+            return ImageFont.load_default()
+        except IOError:
+            print("Error: Cannot load default PIL font.")
+            return None
+    try:
+        return ImageFont.truetype(font_path, size)
+    except IOError:
+        print(f"Error: Could not load font {font_path}. Trying default.")
+        try:
+            return ImageFont.load_default()
+        except IOError:
+            print("Error: Cannot load default PIL font.")
+            return None
+
+def render_text_image(lines, width):
+    """
+    Renders the schedule (list of lines) onto a tall PIL Image.
+    Returns the PIL Image object.
+    """
+    # Load fonts
+    font_title = load_font(FONT_SIZE_TITLE)
+    font_line = load_font(FONT_SIZE_LINE)
+    font_channel = load_font(FONT_SIZE_CHANNEL)
+    if not font_title or not font_line:
+        print("Error: Critical fonts failed to load. Exiting.")
+        sys.exit(1)
+
+    # First, measure the total height needed
+    total_height = 0
+    padding_top = VIDEO_HEIGHT // 2  # Start with half a screen of blank space
+    padding_bottom = VIDEO_HEIGHT # End with a full screen of blank space
+    total_height += padding_top
     
-    # compute height
-    # Lines starting with '[' are category titles (bold)
-    # Lines starting with '  ' (two spaces) are channels
-    # Other lines are event titles
-    y = padding
-    line_metrics = []
-    max_w = 0
     for line in lines:
-        if line.startswith("[") and line.endswith("]"):
-            # Category title
-            bbox = font_title.getbbox(line)
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            line_metrics.append((line, w, h, 'title'))
-            y += h + CATEGORY_SPACING
-            max_w = max(max_w, w)
-        elif line.startswith("  "):
-            # Channel line (smaller font)
-            bbox = font_channel.getbbox(line)
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            line_metrics.append((line, w, h, 'channel'))
-            y += h + LINE_SPACING
-            max_w = max(max_w, w)
-        elif line.strip() == "":
-            # Empty line for spacing
-            line_metrics.append((line, 0, EVENT_SPACING, 'empty'))
-            y += EVENT_SPACING
-        else:
-            # Event line
-            bbox = font_line.getbbox(line)
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            line_metrics.append((line, w, h, 'event'))
-            y += h + LINE_SPACING
-            max_w = max(max_w, w)
+        if line.startswith("TITLE:"):
+            total_height += FONT_SIZE_TITLE + LINE_SPACING
+        elif line.startswith("LINE:"):
+            total_height += FONT_SIZE_LINE + LINE_SPACING
+        elif line.startswith("CHANNEL:"):
+            total_height += FONT_SIZE_CHANNEL + LINE_SPACING
+        elif line.startswith("SPACER:"):
+            total_height += int(line.split(":")[1])
     
-    y += padding
-    img_w = max(width, max_w + padding * 2)
-    img_h = max(y, 300)  # ensure some height
-    im = Image.new("RGB", (img_w, img_h), color=(10, 10, 30))
-    draw = ImageDraw.Draw(im)
-    cur_y = padding
+    total_height += padding_bottom
     
-    for (line, w, h, line_type) in line_metrics:
-        x = padding
-        if line_type == 'title':
-            # Category title - bold effect by drawing multiple times
-            draw.text((x, cur_y), line, font=font_title, fill=(255, 240, 200))
-            draw.text((x+1, cur_y), line, font=font_title, fill=(255, 240, 200))
-            draw.text((x, cur_y+1), line, font=font_title, fill=(255, 240, 200))
-            cur_y += h + CATEGORY_SPACING
-        elif line_type == 'channel':
-            # Channel line - slightly dimmed
-            draw.text((x, cur_y), line, font=font_channel, fill=(180, 180, 200))
-            cur_y += h + LINE_SPACING
-        elif line_type == 'event':
-            # Event line
-            draw.text((x, cur_y), line, font=font_line, fill=(220, 220, 220))
-            cur_y += h + LINE_SPACING
-        elif line_type == 'empty':
-            # Just add spacing
-            cur_y += h
+    # Create the image
+    img = Image.new('RGB', (width, total_height), color=(0, 0, 0)) # Black background
+    d = ImageDraw.Draw(img)
     
-    return im
+    # Start drawing
+    y = padding_top
+    text_x = 40 # Left padding
+    
+    for line in lines:
+        if line.startswith("TITLE:"):
+            text = line.replace("TITLE:", "")
+            d.text((text_x, y), text, font=font_title, fill=(255, 255, 0)) # Yellow
+            y += FONT_SIZE_TITLE + LINE_SPACING
+        elif line.startswith("LINE:"):
+            text = line.replace("LINE:", "")
+            d.text((text_x, y), text, font=font_line, fill=(255, 255, 255)) # White
+            y += FONT_SIZE_LINE + LINE_SPACING
+        elif line.startswith("CHANNEL:"):
+            text = line.replace("CHANNEL:", "")
+            d.text((text_x, y), text, font=font_channel, fill=(160, 160, 160)) # Gray
+            y += FONT_SIZE_CHANNEL + LINE_SPACING
+        elif line.startswith("SPACER:"):
+            y += int(line.split(":")[1])
+            
+    print(f"Rendered image: {width}x{total_height} pixels")
+    return img
 
-def make_scrolling_video_from_image(img, out_path, duration=VIDEO_DURATION_SECONDS,
-                                    video_size=(VIDEO_WIDTH, VIDEO_HEIGHT), fps=FPS,
-                                    audio_path=None):
+def make_scrolling_video_from_image(img, output_path, duration, audio_path=None):
     """
-    Create a vertical scrolling video from a tall image:
-
-    - Starts with blank screen
-    - Image scrolls up from bottom
-    - Continues until last item scrolls off top
-    - Loops 3 times
-    - Use MoviePy to animate and write to out_path (MP4).
-    - Optionally overlay audio (looped if needed).
+    Converts the tall PIL image into a scrolling video.
     """
-    print("  → Saving temporary image...")
-    # save the image temporarily so moviepy can use it
-    tmp_img = os.path.join(OUTPUT_DIR, "tmp_schedule_image.png")
-    img.save(tmp_img)
-
-    W, H = video_size
-    img_w, img_h = img.size
-
-    # Calculate scroll distance: start with image fully below screen, end with image fully above screen
-    # Start position: y = H (image bottom edge at screen bottom, image not visible)
-    # End position: y = -img_h (image top edge at screen top, image not visible)
-    start_y = H
-    end_y = -img_h
-    total_scroll = start_y - end_y  # Total distance to travel
+    img_width, img_height = img.size
     
-    # Calculate duration for one complete scroll
-    # We want smooth scrolling that shows everything
-    single_loop_duration = max(VIDEO_DURATION_SECONDS, total_scroll / 100.0)  # At least 100 pixels per second
+    # Convert PIL Image to numpy array for MoviePy
+    img_np = np.array(img)
     
-    # Total duration for 3 loops
-    total_duration = single_loop_duration * 3
+    # Create the ImageClip
+    img_clip = ImageClip(img_np)
     
-    print(f"  → Video will be {total_duration:.1f} seconds ({single_loop_duration:.1f}s per loop, 3 loops)")
-    print(f"  → Creating video clip...")
-
-    def make_frame(t):
-        # Calculate which loop we're in
-        loop_progress = (t / single_loop_duration) % 1.0  # 0 to 1 for current loop
-        
-        # Calculate y position: interpolate from start_y to end_y
-        y = start_y - (loop_progress * total_scroll)
-        y = int(y)
-        
-        # Create a blank canvas
-        canvas = Image.new("RGB", (W, H), (10, 10, 30))
-        
-        # Paste the schedule image at the calculated y position
-        # Only paste if any part of the image is visible
-        if y < H and y + img_h > 0:
-            canvas.paste(img, (0, y))
-        
-        return np.array(canvas)
-
-    video = VideoClip(make_frame, duration=total_duration)
-
-    # set fps
-    video = video.set_fps(fps).resize(width=W)
-
-    # attach audio if available
-    if audio_path and os.path.isfile(audio_path):
-        print(f"  → Loading audio from {audio_path}...")
-        try:
-            audio = AudioFileClip(audio_path)
-            # loop audio to match duration if shorter
-            if audio.duration < total_duration:
-                print(f"  → Looping audio ({audio.duration:.1f}s → {total_duration:.1f}s)...")
-                # calculate how many loops needed
-                loops = math.ceil(total_duration / audio.duration)
-                # concatenate audio clips
-                audio_clips = [audio] * loops
-                from moviepy.audio.AudioClip import CompositeAudioClip
-                looped_audio = CompositeAudioClip([ac.set_start(i * audio.duration) for i, ac in enumerate(audio_clips)])
-                audio = looped_audio.subclip(0, total_duration)
-            else:
-                audio = audio.subclip(0, total_duration)
-            video = video.set_audio(audio)
-            print("  → Audio attached")
-        except Exception as e:
-            print("  → Warning: unable to load audio:", e)
-            import traceback
-            traceback.print_exc()
+    # Total distance to scroll is the image height minus one screen height
+    scroll_height = img_height - VIDEO_HEIGHT
+    
+    if scroll_height <= 0:
+        print("Image is not tall enough to scroll. Creating static video.")
+        # Just show the top of the image, static
+        scrolled_clip = img_clip.set_position((0, 0)).set_duration(duration)
     else:
-        print("  → No background audio (file not found)")
+        # Define the scrolling animation
+        # (t) goes from 0 to `duration`
+        def scroll(t):
+            # Calculate y position based on time
+            # Linear scroll: y = - (t / duration) * scroll_height
+            # We add a 1-second pause at the start
+            pause_at_start = 1.0
+            scroll_duration = duration - pause_at_start
+            
+            if t < pause_at_start:
+                y = 0
+            else:
+                # Ease-in-out effect for scrolling
+                # x is progress from 0 to 1
+                x = (t - pause_at_start) / scroll_duration
+                # Use a cosine ease-in-out curve
+                ease_x = 0.5 * (1 - math.cos(x * math.pi))
+                y = -ease_x * scroll_height
 
-    print(f"  → Writing MP4 file (this may take 2-3 minutes)...")
-    print(f"     Encoding {total_duration:.0f} seconds at {fps} fps = {int(total_duration * fps)} frames")
-    # write the mp4
-    video.write_videofile(out_path, codec="libx264", audio_codec="aac", threads=0, verbose=False, logger=None)
-    print(f"  → Video saved: {out_path}")
-    
-    # cleanup tmp image
-    try:
-        os.remove(tmp_img)
-    except:
-        pass
+            return (0, int(y)) # (x, y) position
 
-def sleep_until_5_mins_before_hour():
-    """Sleep until 5 minutes before the next hour"""
-    now = datetime.now()
-    next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-    target_time = next_hour - timedelta(minutes=5)
-    
-    # If we're past :55, target next hour's :55
-    if now >= target_time:
-        target_time = target_time + timedelta(hours=1)
-    
-    seconds = (target_time - now).total_seconds()
-    print(f"Sleeping {int(seconds)}s until {target_time.strftime('%Y-%m-%d %H:%M:%S')} (5 mins before hour)")
-    time.sleep(seconds)
+        scrolled_clip = VideoClip(make_frame=lambda t: img_clip.get_frame(t), duration=duration)
+        scrolled_clip = scrolled_clip.set_position(scroll)
 
-def sleep_until_top_of_hour():
-    """Sleep until the top of the hour"""
-    now = datetime.now()
-    next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-    seconds = (next_hour - now).total_seconds()
-    print(f"Sleeping {int(seconds)}s until {next_hour.strftime('%Y-%m-%d %H:%M:%S')} (top of hour)")
-    time.sleep(seconds)
-
-def create_schedule_cycle():
-    tz_london = pytz.timezone("Europe/London")
+    # Create a final composite on a black background
+    final_clip = CompositeVideoClip(
+        [scrolled_clip],
+        size=(VIDEO_WIDTH, VIDEO_HEIGHT),
+        bg_color=(0, 0, 0)
+    ).set_duration(duration)
     
-    while True:
+    # Add audio
+    if audio_path and os.path.isfile(audio_path):
+        print(f"Adding audio from {audio_path}")
         try:
-            # Phase 1: Generate temp file at :55
-            sleep_until_5_mins_before_hour()
-            
-            print("="*60)
-            print("PHASE 1: GENERATING NEW VIDEO")
-            print("="*60)
-            print(f"Time: {datetime.now(tz=tz_london).isoformat()}")
-            
-            print("\n[1/5] Fetching schedule JSON...")
-            j = fetch_schedule_json()
-            print(f"      ✓ Received {len(j)} top-level keys")
-            
-            print("\n[2/5] Building event list...")
-            events = build_event_list(j)
-            print(f"      ✓ Found {len(events)} total events")
-            
-            print("\n[3/5] Filtering and sorting events...")
-            grouped = filter_and_sort_events(events)
-            total_kept = sum(len(evs) for evs in grouped.values())
-            print(f"      ✓ Kept {total_kept} events in {len(grouped)} categories")
-            
-            print("\n[4/5] Building text layout...")
-            lines = build_text_lines(grouped)
-            if not lines:
-                lines = ["No upcoming events"]
-            print(f"      ✓ Generated {len(lines)} lines of text")
-            
-            print("\n[5/5] Rendering video...")
-            # render a tall image
-            img = render_text_image(lines, width=VIDEO_WIDTH)
-            
-            # make video to TEMP file
-            audio_path = BACKGROUND_AUDIO if os.path.isfile(BACKGROUND_AUDIO) else None
-            make_scrolling_video_from_image(img, TEMP_VIDEO_FILENAME, duration=VIDEO_DURATION_SECONDS, audio_path=audio_path)
-            print(f"\n✓ Temp video ready: {os.path.abspath(TEMP_VIDEO_FILENAME)}")
-            
-            # Phase 2: Wait until top of hour, then swap files
-            print("\n" + "="*60)
-            print("PHASE 2: WAITING TO SWAP FILES")
-            print("="*60)
-            sleep_until_top_of_hour()
-            
-            print("\n" + "="*60)
-            print("SWAPPING FILES")
-            print("="*60)
-            print(f"Time: {datetime.now(tz=tz_london).isoformat()}")
-            
-            # Delete old file if exists
-            if os.path.isfile(VIDEO_FILENAME):
-                print(f"  → Deleting old file: {VIDEO_FILENAME}")
-                os.remove(VIDEO_FILENAME)
-            
-            # Rename temp to active
-            print(f"  → Renaming {TEMP_VIDEO_FILENAME} → {VIDEO_FILENAME}")
-            os.rename(TEMP_VIDEO_FILENAME, VIDEO_FILENAME)
-            print(f"\n✓ Video updated successfully!")
-            print(f"  Active file: {os.path.abspath(VIDEO_FILENAME)}")
-            print("")
-            
+            audio = AudioFileClip(audio_path).subclip(0, duration)
+            # If audio is shorter than video, loop it
+            if audio.duration < duration:
+                audio = audio.fx(vfx.loop, duration=duration)
+            final_clip = final_clip.set_audio(audio)
         except Exception as e:
-            print("\n" + "="*60)
-            print("ERROR OCCURRED")
-            print("="*60)
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
-            print("\nWaiting for next cycle...")
-            # If error, wait until next cycle
-            sleep_until_5_mins_before_hour()
+            print(f"Warning: Could not process audio file {audio_path}. Video will be silent. Error: {e}")
+            final_clip = final_clip.set_audio(None)
+    else:
+        print("No background.mp3 found. Video will be silent.")
+        final_clip = final_clip.set_audio(None)
+
+    # Write the file
+    print(f"Writing video to {output_path}...")
+    final_clip.write_videofile(
+        output_path,
+        fps=FPS,
+        codec='libx264',
+        audio_codec='aac',
+        temp_audiofile='temp-audio.m4a',
+        remove_temp=True,
+        preset='medium',
+        threads=4
+    )
+    print("Video write complete.")
 
 
-if __name__ == "__main__":
-    # quick pre-checks
+def generate_full_video_cycle():
+    """
+    Fetches, builds, and renders the video, creating 3 loops.
+    Writes to a temp file first, then swaps.
+    """
+    print(f"--- Starting new cycle at {datetime.now()} ---")
+    
+    # 1. Fetch and parse data
     try:
-        subprocess.check_call(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        print("WARNING: ffmpeg not found on PATH. Not required for MP4 generation.")
+        events = fetch_and_build_event_list() # <-- MODIFIED
+        grouped = filter_and_sort_events(events)
+        lines = build_text_lines(grouped)
+        if not lines:
+            lines = ["TITLE:No upcoming events"]
+    except Exception as e:
+        print(f"CRITICAL: Failed to fetch or parse schedule: {e}")
+        # Don't overwrite existing video if fetch fails
+        return
+
+    # 2. Render image
+    try:
+        img = render_text_image(lines, width=VIDEO_WIDTH)
+    except Exception as e:
+        print(f"CRITICAL: Failed to render text image: {e}")
+        return
+
+    # 3. Make video (single loop)
+    try:
+        audio_path = BACKGROUND_AUDIO if os.path.isfile(BACKGROUND_AUDIO) else None
+        # Write to a temporary file first
+        make_scrolling_video_from_image(img, TEMP_VIDEO_FILENAME, duration=VIDEO_DURATION_SECONDS, audio_path=audio_path)
+    except Exception as e:
+        print(f"CRITICAL: Failed to generate video: {e}")
+        return
+
+    # 4. Concatenate loops and move to final file
+    try:
+        print("Looping video 3 times...")
+        with VideoFileClip(TEMP_VIDEO_FILENAME) as clip:
+            final_loop = concatenate_videoclips([clip, clip, clip])
+            # Use 'ffmpeg' for the final write, it's often faster for simple concats
+            final_loop.write_videofile(
+                VIDEO_FILENAME,
+                codec='libx264',
+                audio_codec='aac',
+                temp_audiofile='temp-audio.m4a',
+                remove_temp=True,
+                preset='fast', # faster preset for loop concat
+                threads=4,
+                logger='bar' # show progress
+            )
+        print("Looping complete. Final file updated:", VIDEO_FILENAME)
+        if os.path.isfile(TEMP_VIDEO_FILENAME):
+            os.remove(TEMP_VIDEO_FILENAME)
+    except Exception as e:
+        print(f"CRITICAL: Failed to loop video and swap file: {e}")
         
+
+def wait_for_next_run():
+    """
+    Waits until 55 minutes past the hour.
+    """
+    while True:
+        now = datetime.now()
+        # We want to generate at :55 so it's ready to swap at :00
+        if now.minute == 55:
+            print(f"Time is {now.strftime('%H:%M:%S')}. Starting generation.")
+            return
+        
+        # Calculate time until next :55
+        if now.minute > 55:
+            # Need to wait for next hour's 55
+            next_run = (now + timedelta(hours=1)).replace(minute=55, second=0, microsecond=0)
+        else:
+            # Wait for this hour's 55
+            next_run = now.replace(minute=55, second=0, microsecond=0)
+            
+        wait_seconds = (next_run - now).total_seconds()
+        
+        if wait_seconds > 60:
+            print(f"Sleeping until {next_run.strftime('%H:%M:%S')}...")
+            time.sleep(wait_seconds)
+        else:
+            # If we are very close, just sleep 1 sec and check again
+            time.sleep(1)
+
+
+def main():
+    # --- Check for dependencies ---
     try:
-        import moviepy  # noqa: F401
-    except Exception:
-        print("ERROR: moviepy or its dependencies missing. Install with:")
-        print("    py -m pip install moviepy imageio-ffmpeg pillow")
+        # Check for ffmpeg binary
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: ffmpeg executable not found.")
+        print("Please install ffmpeg and ensure it is in your system's PATH.")
+        print("You can often install it via: py -m pip install imageio-ffmpeg")
+        exit(1)
+        
+    if 'moviepy' not in sys.modules or 'PIL' not in sys.modules:
+        print("Error: Missing required Python libraries.")
+        print("Please install all dependencies with:")
+        print("py -m pip install requests python-dateutil pytz moviepy imageio-ffmpeg pillow")
         exit(1)
 
     print("Starting schedule->MP4 generator.")
     print("Output directory:", os.path.abspath(OUTPUT_DIR))
-    print("Output file: schedule.mp4 (6 minutes - 3 loops of 2 minutes)")
-    print("Cycle: Generates at :55, swaps at :00")
-    print("")
-    print("Press Ctrl+C to stop.")
-    print("")
+    print("Output file: schedule.mp4 (6 minutes - 3 loops of 2 minutes)\n")
+    print("Press Ctrl+C to stop.\n")
     
-    # Check if we should do an initial generation now
-    now = datetime.now()
+    # --- Initial generation on first run ---
     if not os.path.isfile(VIDEO_FILENAME):
-        print("No existing schedule.mp4 found. Generating initial video...")
+        print("No existing schedule.mp4 found. Generating initial video...\n")
         try:
-            from pytz import timezone
-            tz_london = timezone("Europe/London")
-            j = fetch_schedule_json()
-            events = build_event_list(j)
+            events = fetch_and_build_event_list() # <-- MODIFIED
             grouped = filter_and_sort_events(events)
             lines = build_text_lines(grouped)
             if not lines:
-                lines = ["No upcoming events"]
+                lines = ["TITLE:No upcoming events"]
             img = render_text_image(lines, width=VIDEO_WIDTH)
+            
+            # --- Make single loop first for temp file ---
             audio_path = BACKGROUND_AUDIO if os.path.isfile(BACKGROUND_AUDIO) else None
-            make_scrolling_video_from_image(img, VIDEO_FILENAME, duration=VIDEO_DURATION_SECONDS, audio_path=audio_path)
-            print("Initial MP4 video created:", os.path.abspath(VIDEO_FILENAME))
-            print("")
+            make_scrolling_video_from_image(TEMP_VIDEO_FILENAME, duration=VIDEO_DURATION_SECONDS, audio_path=audio_path)
+            
+            # --- Loop it for the final file ---
+            with VideoFileClip(TEMP_VIDEO_FILENAME) as clip:
+                final_loop = concatenate_videoclips([clip, clip, clip])
+                final_loop.write_videofile(
+                    VIDEO_FILENAME,
+                    codec='libx264',
+                    audio_codec='aac',
+                    temp_audiofile='temp-audio.m4a',
+                    remove_temp=True,
+                    preset='fast',
+                    threads=4,
+                    logger='bar'
+                )
+            
+            print("\nInitial MP4 video created:", os.path.abspath(VIDEO_FILENAME))
+            if os.path.isfile(TEMP_VIDEO_FILENAME):
+                os.remove(TEMP_VIDEO_FILENAME)
+            
         except Exception as e:
-            print("Error creating initial video:", e)
-            import traceback
-            traceback.print_exc()
-            print("")
+            print(f"CRITICAL: Failed to create initial video: {e}")
+            # We can still continue and try the main loop
     
-    create_schedule_cycle()
+    # --- Main hourly loop ---
+    print("\n--- Entering main loop ---")
+    try:
+        while True:
+            wait_for_next_run()
+            generate_full_video_cycle()
+            print(f"\n--- Cycle complete. Next check at {datetime.now() + timedelta(seconds=60)} ---")
+            time.sleep(60) # Sleep 60s to ensure we don't run twice in the same minute
+    except KeyboardInterrupt:
+        print("\nStopping script.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
