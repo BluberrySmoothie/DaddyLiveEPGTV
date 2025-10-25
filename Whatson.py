@@ -523,7 +523,12 @@ def main():
             
             # --- Make single loop first for temp file ---
             audio_path = BACKGROUND_AUDIO if os.path.isfile(BACKGROUND_AUDIO) else None
-            make_scrolling_video_from_image(TEMP_VIDEO_FILENAME, duration=VIDEO_DURATION_SECONDS, audio_path=audio_path)
+            
+            # -----------------------------------------------------------------
+            # !!! THIS IS THE CORRECTED LINE !!!
+            # I was passing TEMP_VIDEO_FILENAME as the 'img' argument by mistake.
+            make_scrolling_video_from_image(img, TEMP_VIDEO_FILENAME, duration=VIDEO_DURATION_SECONDS, audio_path=audio_path)
+            # -----------------------------------------------------------------
             
             # --- Loop it for the final file ---
             with VideoFileClip(TEMP_VIDEO_FILENAME) as clip:
