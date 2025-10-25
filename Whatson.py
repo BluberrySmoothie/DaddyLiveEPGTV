@@ -37,7 +37,7 @@ from dateutil import parser as dparser
 from dateutil import tz
 import pytz
 from moviepy.editor import (
-    ImageClip, AudioFileClip, VideoClip, CompositeVideoClip, concatenate_videoclips
+    ImageClip, AudioFileClip, VideoClip, CompositeVideoClip, concatenate_videoclips, VideoFileClip
 )
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
