@@ -1,3 +1,7 @@
+## Support the Project
+If you like my work, feel free to buy me a coffee! ☕
+https://buymeacoffee.com/BluberrySmoothie
+
 This script will grab the "Live Events" schedule from Daddy Live and create a scrolling MP4 video of whats on.
 
 
